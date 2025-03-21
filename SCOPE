@@ -1,0 +1,448 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+
+@author: Mumu Aktar,ai2lab
+"""
+
+import os
+import pandas as pd
+import torch
+import re
+# from langchain.document_loaders import PDFMinerLoader
+# from langchain.schema import Document
+# from llama_index.core.prompts.prompts import SimpleInputPrompt
+# from llama_index.llms.huggingface import HuggingFaceLLM
+# from langchain.text_splitter import CharacterTextSplitter
+# from llama_index.core import VectorStoreIndex, Document
+# from langchain.embeddings import HuggingFaceEmbeddings
+
+
+from huggingface_hub import login
+login(token='Hugging_Face_Token')
+
+#####################Preprocessing Reports##################################
+def convert_dict_values_to_strings(data):
+    if isinstance(data, dict):
+        return {key: convert_dict_values_to_strings(value) for key, value in data.items()}
+    elif isinstance(data, list):
+        return [convert_dict_values_to_strings(item) for item in data]
+    else:
+        return str(data)
+
+def clean_report(text):
+    if isinstance(text, list):
+       return [clean_report(item) for item in text]
+    clean_text = re.sub(r'Dictated using.*|Signed by.*', '', text)
+    clean_text = re.sub(r'\n+', '\n', clean_text)
+    return clean_text.strip()
+
+def clean_medical_report(report_text):
+    """
+    Cleans a medical report by removing extra spaces and unwanted phrases.
+
+    :param report_text: Raw text of the medical report
+    :return: Cleaned medical report text
+    """
+    # Define unwanted phrases to remove
+    unwanted_phrases = [
+        r"Dictated with Voice Recognition Software",
+        r"\*{5,} Final Report \*{5,}",  # Matches "***** Final Report *****"
+        r"Dictated by.*",
+        r"Signed by.*",
+        r"Date/Time Signed:.*",
+        r"Text Value:.*"
+    ]
+    
+    # Remove unwanted phrases
+    for phrase in unwanted_phrases:
+        report_text = re.sub(phrase, "", report_text, flags=re.IGNORECASE)
+        
+            
+    report_text = re.sub(r"^\*+\s*", "", report_text, flags=re.MULTILINE)
+    # Remove excessive blank lines (more than one newline)
+    report_text = re.sub(r"\n\s*\n+", "\n\n", report_text)
+
+    # Strip leading/trailing whitespace
+    return report_text.strip()
+
+
+# Dictionary mapping acronyms to their full names
+acronym_to_fullname = {
+    r'\bACA\b': 'Anterior Cerebral Artery',
+    r'\bMCA\b': 'Middle Cerebral Artery',
+    r'\bPCA\b': 'Posterior Cerebral Artery',
+    r'\bBA\b': 'Basilar Artery',
+    r'\bICA\b': 'Internal Carotid Artery',
+    r'\bVA\b': 'Vertebral Artery'
+}
+
+def replace_acronyms(report_text):
+    """
+    Replaces acronyms in the given medical report with their full names.
+    
+    Args:
+        report_text (str): The original medical report text.
+        
+    Returns:
+        str: The processed report with acronyms replaced by full names.
+    """
+    for acronym, fullname in acronym_to_fullname.items():
+        report_text = re.sub(acronym, fullname, report_text)
+    return report_text
+
+
+
+###################CleanUp PDF#############################
+from langchain.document_loaders import PDFMinerLoader
+from langchain.schema import Document
+
+def filter_references(text):
+    """
+    Removes reference sections from text based on patterns and keywords.
+    """
+    reference_keywords = ["Author information","References", "REFERENCES","Bibliography", "cited by", "Finding", "Funding","Acknowledgments","Disclosure","Conflict of interest"]
+    
+    reference_patterns = [
+        r"^\d+\.\s",  # Matches lines starting with a number followed by a dot and space
+        r"[A-Za-z]+ et al\., \d{4}",  # Matches author-date patterns like "Smith et al., 2020"
+    ]
+    
+    # Split text at reference keywords
+    for keyword in reference_keywords:
+        if keyword.lower() in text.lower():
+            text = text.split(keyword, 1)[0]
+    
+    # Remove lines matching reference patterns
+    lines = text.split("\n")
+    filtered_lines = [
+        line for line in lines if not any(re.search(pattern, line) for pattern in reference_patterns)
+    ]
+    
+    return "\n".join(filtered_lines).strip()
+ 
+    
+###############Load PDF####################################
+  
+def load_papers_with_pdfminer(papers_dir):
+    paper_documents = []
+    paper_files = [f for f in os.listdir(papers_dir) if f.endswith('.pdf')]  # Support only PDF files
+
+    for paper_file in paper_files:
+        paper_path = os.path.join(papers_dir, paper_file)
+        try:
+            # Load PDF using PDFMinerLoader
+            loader = PDFMinerLoader(paper_path)
+            documents = loader.load()
+
+            for doc in documents:
+             
+                page_text = filter_references(doc.page_content)  
+                page_metadata = {
+                    "paper_title": os.path.splitext(paper_file)[0],
+                    "paper_path": paper_path,
+                    "page_number": doc.metadata.get('page_number', 'unknown')  
+                }
+
+               
+                paper_documents.append(Document(page_content=page_text, metadata=page_metadata))
+
+        except Exception as e:
+            print(f"Error processing file {paper_file}: {e}")
+
+    return paper_documents
+
+
+
+##################Loading Llama base model##########################
+def setup_llm_model():
+    from transformers import (
+        AutoModelForCausalLM,
+        AutoTokenizer,
+        BitsAndBytesConfig,
+        HfArgumentParser,
+        TrainingArguments,
+        pipeline,
+        logging,
+    )
+
+    from peft import (
+        LoraConfig,
+        PeftModel,
+        prepare_model_for_kbit_training,
+        get_peft_model,
+    )
+  
+
+
+    base_model="meta-llama/Llama-3.1-8B-instruct"
+
+    torch_dtype = torch.float16
+    attn_implementation = "eager"
+
+    # QLoRA config
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch_dtype,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
+        base_model,
+        quantization_config=bnb_config,
+        device_map="auto",
+        attn_implementation=attn_implementation
+    )
+    peft_config = LoraConfig(
+        r=4,
+        lora_alpha=16,
+        lora_dropout=0,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=['up_proj', 'down_proj', 'gate_proj', 'k_proj', 'q_proj', 'v_proj', 'o_proj']
+    )
+    model = get_peft_model(model, peft_config)
+
+
+    tokenizer = AutoTokenizer.from_pretrained(base_model)
+   
+   
+    return model, tokenizer
+
+
+
+##################Prompt used to identify stroke vs non-stroke#################################
+from llama_index.core.prompts.prompts import SimpleInputPrompt
+from llama_index.llms.huggingface import HuggingFaceLLM
+
+
+def query_knowledge_base(report, query, index, model, tokenizer):
+    """
+    Query the knowledge base using LlamaIndex with the given report and query.
+    """
+    system_prompt = """<|begin_of_text|><|start_header_id|>system<|end_header_id|> You are a Retrieval-Augmented Generation (RAG) system tasked with analyzing a medical report to determine whether the patient has been diagnosed with an acute or subacute stroke. Consider the presence of conditions like below as evidence for stroke such as:  
+
+
+-Acute or subacute ischemic or ischaemic (in addition to ischemia)  
+
+-Acute or subacute Cerebral/Lentiform/Insular/Cortical/Cerebellar/internal capsule infarction (or infarct)  
+
+-Left/right middle cerebral artery/territory or M2 branch occlusion
+
+-hemorrhage  
+ 
+-Sudden and acute or subacute neurological symptoms like loss of gray white, wedge shaped area of hypodensity based on the report only if they lead to acute or subacute stroke  
+ 
+-Early ischemic change  
+
+-Acute or subacute (anterior / middle / posterior / basilar / carotid / vertebral artery) occlusion  
+
+-Acute or subacute (anterior / middle / posterior / basilar / carotid / vertebral artery) thrombus  
+
+-Acute or subacute (anterior / middle / posterior / basilar / carotid / vertebral artery) embolus  
+
+If the report does not show evidence of such an acute or subacute event, respond with 'No' and provide a brief explanation. If the report indicates a stroke, respond with 'Yes' and provide evidence of the acute or subacute event(s).  
+
+Please ignore chronic conditions like chronic infarcts or old infarcts as they do not indicate a stroke event.  
+
+Be concise and specific. If unsure about any report, say 'No,' focusing solely on acute or subacute stroke-related events. <|eot_id|>
+
+"""
+   
+    query_wrapper_prompt = SimpleInputPrompt("<|start_header_id|>user<|end_header_id|>\n{query_str}\n<|eot_id|>\n<|start_header_id|>assistant<|end_header_id|>\n")  # Properly wrap the input
+    full_query = f"Medical Report:\n{report}\n\nQuery:\n{query}"
+    formatted_query = query_wrapper_prompt.format(query_str=full_query)  
+    llm = HuggingFaceLLM(
+        context_window=4096,
+        max_new_tokens=256,  
+        system_prompt=system_prompt,  
+        model=model,
+        tokenizer=tokenizer,
+        tokenizer_kwargs={"pad_token_id": tokenizer.pad_token_id or tokenizer.eos_token_id},
+
+
+    )
+    
+    query_engine = index.as_query_engine(llm=llm, top_k=20)
+    response = query_engine.query(formatted_query)
+    return response
+
+
+################Knowledge base generation###################################
+
+#Setup LLM and tokenizer
+model,tokenizer = setup_llm_model()
+
+#Read resources as PDF
+papers_dir='knowledge base resources directory'
+paper_documents=load_papers_with_pdfminer(papers_dir)
+
+
+from langchain.text_splitter import CharacterTextSplitter
+from llama_index.core import VectorStoreIndex, Document
+from langchain.embeddings import HuggingFaceEmbeddings
+
+
+    
+def create_knowledge_base(documents):
+    """
+    Create a knowledge base by indexing documents using a local embedding model.
+    """
+ 
+    hf_embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+    text_splitter = CharacterTextSplitter(chunk_size=1000, chunk_overlap=0)  # Customize chunk size and overlap
+    chunks = text_splitter.split_documents(documents)
+    print(len(chunks),chunks[0])
+    
+    llama_index_chunks = [Document(text=chunk.page_content, metadata=chunk.metadata) for chunk in chunks]
+
+ 
+    for i, chunk in enumerate(chunks[:1]):  # Check only the first chunk
+        print(f"Attributes of the chunk: {dir(chunk)}")
+        print(f"Chunk Dict: {chunk.dict()}")
+
+    
+    index = VectorStoreIndex.from_documents(llama_index_chunks, embed_model=hf_embeddings)  # Create the index with the chunked documents
+    return chunks,index
+
+
+#############################SCOPE (Llama3.1 + RAG) Pipeline to test reports to identify stroke vs non-stroke#########################################
+
+  
+#Create Knowledge Base by indexing the documents
+chunks,index = create_knowledge_base(paper_documents)
+
+######printing index#############################################
+docstore = index.storage_context.docstore
+s=0
+for doc_id, node in docstore.docs.items():
+        s=s+1
+        print(f"Document ID: {doc_id}")
+        if hasattr(node, 'text'):  # Check if the node has the 'text' attribute
+            print(f"Content: {node.text}")
+        else:
+            print("No content available.")
+        if hasattr(node, 'metadata'):
+            print(f"Metadata: {node.metadata}")
+        else:
+            print("No metadata available.")
+        print("-" * 50)
+
+
+####################Read reports for testing with SCOPE###################
+test_report_path = 'test_directory'
+subfolders = [f.path for f in os.scandir(test_report_path) if f.is_dir()]
+# subfolders=subfolders[4500:5000]
+test_documents = []
+tt=0
+tt1=0
+# Process subfolders and create document objects
+for subfolder in subfolders:
+    subject_name = os.path.basename(subfolder)
+    text_files = [f for f in os.listdir(subfolder) if f.endswith('.txt')]
+    if text_files:
+        tt=tt+1
+        report_path = os.path.join(subfolder, text_files[0])
+        with open(report_path, 'r') as file:
+            report_text = file.read().strip()
+            document_text=replace_acronyms(report_text)
+            document_text=clean_medical_report(document_text)
+            test_documents.append({"content": document_text, "metadata": {"subject_name": subject_name}})
+    else:
+        print(f"the folder is empty{subject_name}")
+        tt1=tt1+1
+     
+
+
+positive_patients=[]
+patient_labels=[]
+count=0
+d=0
+
+for doc in test_documents:
+    d= d +1
+    print("running patient:",d)
+    subject_name = doc["metadata"]["subject_name"]
+    report_content = doc["content"]  
+    query = "Is the patient diagnosed with stroke based on the given report?"
+    response = query_knowledge_base(
+    report=report_content,
+    query=query,
+    index=index,
+    model=model,
+    tokenizer=tokenizer,
+  
+)
+    f_response=response.response
+    response_text=f_response
+    response_text = response_text.strip().lower()
+    if response_text=='Empty Response':
+        count=count + 1
+ 
+    if "yes" in response_text:
+        positive_patients.append(subject_name)
+        print(f"Patient {subject_name} has a stroke diagnosis.")
+     
+
+#################Evaluation Metric################################3
+import os
+import pandas as pd
+ground_truth_df = pd.read_csv('GT_label.csv')
+ground_truth_dict = dict(zip(ground_truth_df['patient ID'], ground_truth_df['diagnosis of stroke']))
+ground_truth_dict = {str(k).zfill(10): v for k, v in ground_truth_dict.items()}
+brain_files_dir ='test directory'
+brain_patient_ids = set(os.listdir(brain_files_dir)) 
+
+
+true_positives = 0
+false_positives = 0
+false_negatives = 0
+true_negatives = 0
+FP = []
+FN = []
+cc=0
+
+for patient_id, ground_truth_label in ground_truth_dict.items():
+    if patient_id in brain_patient_ids:
+        
+        if patient_id in positive_patients:  
+            if ground_truth_label == 1:
+                true_positives += 1  # Correctly predicted stroke
+            else:
+                false_positives += 1  # Incorrectly predicted stroke
+                # index = ground_truth_df.index[ground_truth_df['patient ID'] == patient_id].tolist()
+                FP.append(patient_id)
+        else:
+            if ground_truth_label == 1:
+                false_negatives += 1  # Missed a stroke case
+                # index = ground_truth_df.index[ground_truth_df['patient ID'] == patient_id].tolist()
+                FN.append(patient_id) 
+                # FN.append(patient_id)
+            else:
+                true_negatives += 1  # Correctly predicted no stroke
+    else:
+        print("not found:..................",patient_id)
+        cc =cc +1
+# Calculate performance metrics
+accuracy = (true_positives + true_negatives) / len(brain_patient_ids)
+precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+# Output the results
+print(f"Accuracy: {accuracy:.4f}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall: {recall:.4f}")
+print(f"F1-Score: {f1_score:.4f}")
+print(f"True Positives: {true_positives}")
+print(f"False Positives: {false_positives}")
+print(f"True Negatives: {true_negatives}")
+print(f"False Negatives: {false_negatives}")
+print(f"False Positives Patient IDs: {FP}")
+print(f"False Negatives Patient IDs: {FN}")
+
+
+
+
+
