@@ -10,11 +10,17 @@ If you find our project useful for your research, please consider citing our pap
 
 
 @inproceedings{mumu2025SCOPE,
+
   title={SCOPE:Label extraction of stroke diagnosis from unstructured medical reports using Retrieval-Augmented Generation},
+  
   author={Aktar, Mumu and Jindal, Gunjan and Bosshart, Salome L and Stebner, Alexander and Paiva, Pedro and Bento, Mariana and Ospel, Johanna M and Souza, Roberto },
+  
   booktitle={American Journal of Neuroradiology},
+  
   pages={206--228},
+  
   year={2023},
+  
   organization={Springer}
 }
 
