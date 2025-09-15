@@ -7,6 +7,8 @@ This study introduces SCOPE, a novel approach combining modern Large Language Mo
 
 If you find our project useful for your research, please consider citing our paper and codebase with the following BibTeX:
 
+
+
 @inproceedings{mumu2025SCOPE,
   title={SCOPE:Label extraction of stroke diagnosis from unstructured medical reports using Retrieval-Augmented Generation},
   author={Aktar, Mumu and Jindal, Gunjan and Bosshart, Salome L and Stebner, Alexander and Paiva, Pedro and Bento, Mariana and Ospel, Johanna M and Souza, Roberto },
